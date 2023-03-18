@@ -8,11 +8,37 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
+/**
+ * 微博抢红包
+ * 两个步骤
+ * 1 抢红包，设置红包总金额，红包个数，返回抢红包的地址
+ * GET /set?uid=1&money=100&num=100
+ * 2 抢红包，先到先得，随机得到红包金额
+ * GET /get?id=1&uid=1
+ * 注意：
+ * 线程安全1，红包列表 packageList map 改用线程安全的 sync.Map
+ * 线程安全2，红包里面的金额切片 packageList map[uint32][]uint 并发读写不安全，虽然不会报错
+ * 优化 channel 的吞吐量，启动多个处理协程来执行 channel 的消费
+ * wrk -t10 -c10 -d5 "http://localhost:8080/set?uid=1&money=100&num=100"
+ */
+
 // 当前有效红包列表，uint32是红包唯一ID，[]uint是红包里面随机分到的金额（单位分）
-var packageList = make(map[uint32][]uint)
+//var packageList = make(map[uint32][]uint)
+var packageList = new(sync.Map)
+
+const taskNum = 16
+
+var chTaskList = make([]chan task, taskNum)
+
+// 任务结构
+type task struct {
+	id       uint32
+	callback chan uint
+}
 
 func main() {
 	app := newApp()
@@ -26,13 +52,16 @@ type lotteryController struct {
 // Get 返回全部红包地址
 func (l lotteryController) Get() map[uint32][2]int {
 	rs := make(map[uint32][2]int)
-	for id, list := range packageList {
+	packageList.Range(func(key, value any) bool {
+		id := key.(uint32)
+		list := value.([]uint)
 		var money int
 		for _, v := range list {
 			money += int(v)
 		}
 		rs[id] = [2]int{len(list), money}
-	}
+		return true
+	})
 	return rs
 }
 
@@ -89,7 +118,7 @@ func (l *lotteryController) GetSet() string {
 	}
 	// 最后再来一个红包的唯一ID
 	id := r.Uint32()
-	packageList[id] = list
+	packageList.Store(id, list)
 	// 返回抢红包的URL
 	return fmt.Sprintf("/get?id=%d&uid=%d&num=%d\n", id, uid, num)
 }
@@ -105,28 +134,48 @@ func (l *lotteryController) GetGet() string {
 	if uid < 1 || id < 1 {
 		return fmt.Sprintf("参数数值异常，uid=%d, id=%d\n", uid, id)
 	}
-	list, ok := packageList[uint32(id)]
-	if !ok || len(list) < 1 {
-		return fmt.Sprintf("红包不存在,id=%d\n", id)
-	}
-	// 分配的随机数
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	// 从红包金额中随机得到一个
-	i := r.Intn(len(list))
-	money := list[i]
-	// 更新红包列表中的信息
-	if len(list) > 1 {
-		if i == len(list)-1 {
-			packageList[uint32(id)] = list[:i]
-		} else if i == 0 {
-			packageList[uint32(id)] = list[1:]
-		} else {
-			packageList[uint32(id)] = append(list[:i], list[i+1:]...)
-		}
-	} else {
-		delete(packageList, uint32(id))
+	var t = task{id: uint32(id), callback: make(chan uint)}
+	// 发送任务
+	taskId := id % taskNum
+	chTaskList[taskId] <- t
+	// 接收返回结果
+	money := <-t.callback
+	if money <= 0 {
+		return fmt.Sprintf("很遗憾，没有抢到红包\n")
 	}
 	return fmt.Sprintf("恭喜你抢到一个红包，金额为:%d\n", money)
+}
+
+func fetchPackageMoney(chTasks chan task) {
+	for {
+		t := <-chTasks
+		id := t.id
+		l, ok := packageList.Load(id)
+		if ok && l != nil {
+			list := l.([]uint)
+			// 分配的随机数
+			r := rand.New(rand.NewSource(time.Now().UnixNano()))
+			// 从红包金额中随机得到一个
+			i := r.Intn(len(list))
+			money := list[i]
+			// 更新红包列表中的信息
+			if len(list) > 1 {
+				if i == len(list)-1 {
+					packageList.Store(id, list[:i])
+				} else if i == 0 {
+					packageList.Store(id, list[1:])
+				} else {
+					packageList.Store(id, append(list[:i], list[i+1:]...))
+				}
+			} else {
+				packageList.Delete(id)
+			}
+			t.callback <- money
+		} else {
+			t.callback <- 0
+		}
+
+	}
 }
 
 func newApp() *iris.Application {
@@ -134,6 +183,10 @@ func newApp() *iris.Application {
 	mvc.New(app.Party("/")).Handle(new(lotteryController))
 	// 初始化日志信息
 	initLog()
+	for i := 0; i < taskNum; i++ {
+		chTaskList[i] = make(chan task)
+		go fetchPackageMoney(chTaskList[i])
+	}
 	return app
 }
 
